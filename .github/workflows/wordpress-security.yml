@@ -1,0 +1,162 @@
+name: Wordpress Vuln scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  MYSQL_ROOT_PASSWORD: ${{ secrets.VLAD_MARIUS_DB_PASS }}
+  MYSQL_DATABASE: ${{ secrets.VLAD_MARIUS_DB_NAME }}
+  MYSQL_USER: ${{ secrets.VLAD_MARIUS_DB_USER }}
+  MYSQL_PASSWORD: ${{ secrets.VLAD_MARIUS_DB_PASS }}
+  WPSCAN_API_TOKEN: ${{ secrets.VLAD_MARIUS_WPSCAN_TOKEN }}
+
+
+jobs:
+  wordpress-security-scan:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        wordpress_setup:
+          - name: "old-wordpress"
+            version: "5.0"
+            plugins: "ultimate-member,wp-file-manager"
+            port: "8080"
+          - name: "recent-wordpress"
+            version: "6.1"
+            plugins: "elementor,woocommerce"
+            port: "8081"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create Docker network
+      run: docker network create wp-net-${{ matrix.wordpress_setup.name }}
+
+    - name: Start Mysql
+      run: |
+        docker run -d \
+          --name mysql-${{ matrix.wordpress_setup.name }} \
+          --network wp-net-${{ matrix.wordpress_setup.name }} \
+          -e MYSQL_ROOT_PASSWORD=${{ env.MYSQL_ROOT_PASSWORD }} \
+          -e MYSQL_DATABASE=${{ env.MYSQL_DATABASE }} \
+          -e MYSQL_USER=${{ env.MYSQL_USER }} \
+          -e MYSQL_PASSWORD=${{ env.MYSQL_PASSWORD }} \
+          mysql:8.0 \
+          --default-authentication-plugin=mysql_native_password
+
+    - name: Wait for mysql
+      run: |
+        sleep 15
+        for i in {1..20}; do
+          if docker exec mysql-${{ matrix.wordpress_setup.name }} mysqladmin ping -h localhost --silent; then
+            echo "MySQL ready"
+            break
+          fi
+          sleep 3
+        done
+
+    - name: Start site
+      run: |
+        docker run -d \
+          --name wordpress-${{ matrix.wordpress_setup.name }} \
+          --network wp-net-${{ matrix.wordpress_setup.name }} \
+          -p ${{ matrix.wordpress_setup.port }}:80 \
+          -e WORDPRESS_DB_HOST=mysql-${{ matrix.wordpress_setup.name }}:3306 \
+          -e WORDPRESS_DB_NAME=${{ env.MYSQL_DATABASE }} \
+          -e WORDPRESS_DB_USER=${{ env.MYSQL_USER }} \
+          -e WORDPRESS_DB_PASSWORD=${{ env.MYSQL_PASSWORD }} \
+          wordpress:${{ matrix.wordpress_setup.version }}
+
+    - name: Wait site
+      run: |
+        sleep 20
+        for i in {1..30}; do
+          if curl -f -s http://localhost:${{ matrix.wordpress_setup.port }}/wp-admin/install.php > /dev/null 2>&1; then
+            echo "WordPress ready"
+            break
+          fi
+          sleep 5
+        done
+
+    - name: Configure wp site
+      run: |
+        docker exec wordpress-${{ matrix.wordpress_setup.name }} bash -c "
+          apt-get update && apt-get install -y curl
+          curl -sL https://github.com/wp-cli/wp-cli/releases/download/v2.8.1/wp-cli-2.8.1.phar -o wp-cli.phar
+          chmod +x wp-cli.phar
+          mv wp-cli.phar /usr/local/bin/wp
+          
+          wp core install \
+            --url=http://localhost:${{ matrix.wordpress_setup.port }} \
+            --title='Test Site' \
+            --admin_user=admin \
+            --admin_password=password123 \
+            --admin_email=admin@test.com \
+            --allow-root
+          
+          # Install plugins
+          IFS=',' read -ra PLUGINS <<< '${{ matrix.wordpress_setup.plugins }}'
+          for plugin in \"\${PLUGINS[@]}\"; do
+            wp plugin install \$plugin --activate --allow-root || true
+          done
+        "
+
+    - name: Install wpscan
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ruby ruby-dev
+        sudo gem install wpscan
+
+    - name: Update wpscan db
+      env:
+        WPSCAN_API_TOKEN: ${{ secrets.VLAD_MARIUS_WPSCAN_TOKEN }}
+      run: |
+        wpscan --update --api-token $WPSCAN_API_TOKEN || wpscan --update
+
+    - name: Run wpscan - ${{ matrix.wordpress_setup.name }}
+      env:
+        WPSCAN_API_TOKEN: ${{ secrets.VLAD_MARIUS_WPSCAN_TOKEN }}
+      run: |
+        echo "WPSCAN RESULTS: ${{ matrix.wordpress_setup.name }}"
+        echo "WordPress: ${{ matrix.wordpress_setup.version }}"
+        echo "Plugins: ${{ matrix.wordpress_setup.plugins }}"
+        
+        # Disable immediate exit on error to capture exit code
+        set +e
+        
+        wpscan --url http://localhost:${{ matrix.wordpress_setup.port }} \
+          --api-token ${{ env.WPSCAN_API_TOKEN }} \
+          --enumerate vp,vt \
+          --detection-mode aggressive \
+          --format cli
+        
+        # Capture the exit code
+        exit_code=$?
+        
+        echo "SCAN SUMMARY FOR: ${{ matrix.wordpress_setup.name }}"
+        
+        if [ $exit_code -eq 0 ]; then
+          echo "secure!"
+        elif [ $exit_code -eq 5 ]; then
+          echo "vulns detected!"
+        elif [ $exit_code -eq 4 ]; then
+          echo "ERROR FOR SCAN"
+          exit $exit_code
+        else
+          echo "error for scan"
+          exit $exit_code
+        fi
+        
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop wordpress-${{ matrix.wordpress_setup.name }} mysql-${{ matrix.wordpress_setup.name }} 2>/dev/null || true
+        docker rm wordpress-${{ matrix.wordpress_setup.name }} mysql-${{ matrix.wordpress_setup.name }} 2>/dev/null || true
+        docker network rm wp-net-${{ matrix.wordpress_setup.name }} 2>/dev/null || true
